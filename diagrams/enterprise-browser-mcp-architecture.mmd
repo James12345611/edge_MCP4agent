@@ -1,0 +1,41 @@
+flowchart TB
+  ADMIN["Enterprise admin<br/>MDM and GPO"] --> POLICY["Signed policy store<br/>caller, origin and tool ACL"]
+  ADMIN --> DEPLOY["Signed internal deployment<br/>MSI, extension and SBOM"]
+
+  subgraph Host["Approved AI host"]
+    direction LR
+    AGENT["Agent runtime"] -->|"MCP stdio"| MCP["MCP Server Adapter"]
+  end
+
+  subgraph Desktop["Per-user desktop security boundary"]
+    direction LR
+    MCP -->|"Named Pipe<br/>SID and caller verification"| BROKER["Local Broker<br/>policy, grants and queues"]
+    NATIVE["Native Host Adapter"] -->|"Named Pipe<br/>SID and binary verification"| BROKER
+    POLICY --> BROKER
+    BROKER --> DLP["Output minimization<br/>and DLP"]
+    BROKER --> AUDIT["Redacted audit<br/>Event Log and SIEM"]
+  end
+
+  subgraph Edge["Managed Microsoft Edge"]
+    direction LR
+    EXT["Signed MV3 extension<br/>user share and CDP controller"]
+    TAB["User-shared tab<br/>approved origin"]
+    EXT <-->|"bounded CDP operations"| TAB
+  end
+
+  EXT <-->|"Native Messaging<br/>allowed extension ID"| NATIVE
+  DEPLOY --> MCP
+  DEPLOY --> BROKER
+  DEPLOY --> NATIVE
+  DEPLOY --> EXT
+  DLP -->|"bounded MCP result"| MCP
+
+  classDef trust fill:#dcfce7,stroke:#15803d,color:#052e16
+  classDef control fill:#dbeafe,stroke:#1d4ed8,color:#172554
+  classDef user fill:#ffedd5,stroke:#c2410c,color:#431407
+  classDef admin fill:#f3e8ff,stroke:#7e22ce,color:#3b0764
+
+  class BROKER,NATIVE,EXT trust
+  class MCP,POLICY,DLP,AUDIT control
+  class TAB,AGENT user
+  class ADMIN,DEPLOY admin

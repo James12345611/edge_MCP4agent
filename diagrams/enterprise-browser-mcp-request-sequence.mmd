@@ -1,0 +1,38 @@
+sequenceDiagram
+  actor U as User
+  participant E as Managed Extension
+  participant N as Native Host
+  participant B as Local Broker
+  participant M as MCP Server
+  participant A as Approved Agent
+  participant P as Shared Page
+
+  U->>E: Share current tab for 15 minutes
+  E->>N: tab_shared(tab, origin, capabilities, ttl)
+  N->>B: Forward grant over secured Named Pipe
+  B->>B: Validate browser identity and signed policy
+  B-->>E: grant_id and SHARED state
+
+  A->>M: MCP tool call(tab_handle, arguments)
+  M->>B: execute(operation_id, tool, arguments)
+  B->>B: Validate caller, owner, grant, origin and policy
+
+  alt Request denied
+    B->>B: Write redacted denial audit
+    B-->>M: Stable policy error
+    M-->>A: MCP error
+  else Request authorized
+    B->>N: execute_browser_command
+    N->>E: Native Messaging command
+    E->>E: Revalidate tab, document, frame and ref
+    E->>P: Dispatch once through bounded CDP operation
+    P-->>E: Browser result or event receipt
+    E-->>N: Bounded result
+    N-->>B: Operation result
+    B->>B: DLP, output budget and redacted audit
+    B-->>M: Sanitized result
+    M-->>A: MCP content
+  end
+
+  Note over B,E: Navigation, revocation, disconnect or TTL expiry invalidates the grant
+  Note over B,A: A dispatched timeout returns OUTCOME_UNKNOWN and is never replayed automatically

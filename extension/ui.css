@@ -1,0 +1,51 @@
+:root {
+  font-family: "Segoe UI", sans-serif;
+  color: #17202a;
+  background: #fff;
+}
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 16px;
+}
+
+header {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #d5d8dc;
+}
+
+#connection {
+  color: #566573;
+  font-size: 12px;
+}
+
+#page {
+  max-height: 44px;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+#status {
+  color: #176b4d;
+  font-size: 13px;
+}
+
+button {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid #1f618d;
+  border-radius: 4px;
+  background: #1f618d;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+#revoke {
+  border-color: #a93226;
+  background: #fff;
+  color: #a93226;
+}

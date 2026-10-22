@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Enterprise Browser MCP",
+  "version": "0.1.0",
+  "description": "Share selected Edge tabs with the enterprise MCP.",
+  "minimum_chrome_version": "125",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "storage",
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Enterprise Browser MCP"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
