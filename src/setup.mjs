@@ -129,6 +129,6 @@ export async function setup({ configPath = DEFAULT_CONFIG, extensionDir } = {}) 
     extensionId: id,
     nativeHost: nativeHostExe,
     nativeManifest: nativeManifestPath,
-    next: 'Load extensionDir as an unpacked Edge extension, then click its toolbar icon and share the Ozon tab.',
+    next: 'Load extensionDir as an unpacked Edge extension, then click its toolbar icon and share the target tab.',
   };
 }

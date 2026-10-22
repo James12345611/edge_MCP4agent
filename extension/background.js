@@ -1,5 +1,6 @@
+import { normalizeGrantMinutes } from './grant-policy.js';
+
 const NATIVE_HOST = 'com.enterprise.browser_mcp';
-const GRANT_TTL_MS = 15 * 60 * 1000;
 const grants = new Map();
 const claims = new Map();
 let port;
@@ -55,15 +56,17 @@ async function cleanupGrants() {
   }
 }
 
-async function shareCurrentTab(tabId) {
+async function shareCurrentTab(tabId, requestedMinutes) {
   const tab = await chrome.tabs.get(tabId);
   const origin = originOf(tab.url);
+  const grantMinutes = normalizeGrantMinutes(requestedMinutes);
   const grant = {
     grant_id: crypto.randomUUID(),
     tab_id: tabId,
     origin,
+    duration_minutes: grantMinutes,
     created_at: Date.now(),
-    expires_at: Date.now() + GRANT_TTL_MS,
+    expires_at: Date.now() + grantMinutes * 60 * 1000,
     capabilities: ['read', 'read_same_origin'],
   };
   grants.set(tabId, grant);
@@ -293,7 +296,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const tab = await chrome.tabs.get(message.tab_id);
       return { shared: grants.has(tab.id), grant: grants.get(tab.id), title: tab.title, url: tab.url, native_connected: !!port };
     }
-    if (message.type === 'share_tab') return await shareCurrentTab(message.tab_id);
+    if (message.type === 'share_tab') return await shareCurrentTab(message.tab_id, message.duration_minutes);
     if (message.type === 'revoke_tab') {
       await revoke(message.tab_id);
       return { shared: false };

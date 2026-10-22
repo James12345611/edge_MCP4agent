@@ -33,6 +33,38 @@ header {
   font-size: 13px;
 }
 
+#duration-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.duration-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#duration-minutes {
+  width: 72px;
+  min-height: 32px;
+  box-sizing: border-box;
+  border: 1px solid #aeb6bf;
+  border-radius: 4px;
+  padding: 4px 8px;
+  color: inherit;
+  background: #fff;
+  font: inherit;
+}
+
+#duration-minutes:disabled {
+  background: #f2f3f4;
+  color: #566573;
+}
+
 button {
   width: 100%;
   min-height: 36px;
