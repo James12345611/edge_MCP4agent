@@ -1,41 +1,35 @@
-flowchart TB
-  ADMIN["Enterprise admin<br/>MDM and GPO"] --> POLICY["Signed policy store<br/>caller, origin and tool ACL"]
-  ADMIN --> DEPLOY["Signed internal deployment<br/>MSI, extension and SBOM"]
-
-  subgraph Host["Approved AI host"]
-    direction LR
-    AGENT["Agent runtime"] -->|"MCP stdio"| MCP["MCP Server Adapter"]
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryTextColor": "#17202a", "lineColor": "#374151"}}}%%
+flowchart LR
+  subgraph AgentHost["企业批准的本地 Agent 进程"]
+    AGENT["Agent / MCP Host"]
+    MCP["MCP Adapter<br/>21 个浏览器工具"]
+    CLIENT["AttachClient<br/>请求关联与超时"]
+    AGENT -->|"MCP stdio"| MCP
+    MCP --> CLIENT
   end
 
-  subgraph Desktop["Per-user desktop security boundary"]
-    direction LR
-    MCP -->|"Named Pipe<br/>SID and caller verification"| BROKER["Local Broker<br/>policy, grants and queues"]
-    NATIVE["Native Host Adapter"] -->|"Named Pipe<br/>SID and binary verification"| BROKER
-    POLICY --> BROKER
-    BROKER --> DLP["Output minimization<br/>and DLP"]
-    BROKER --> AUDIT["Redacted audit<br/>Event Log and SIEM"]
+  subgraph Local["当前 Windows 用户本机"]
+    CONFIG["本机配置<br/>端口、Token、扩展 ID"]
+    HUB["Loopback Hub<br/>鉴权、句柄、租约、串行队列"]
+    CLIENT -->|"WebSocket /client<br/>Bearer Token"| HUB
+    CONFIG --> CLIENT
+    CONFIG --> HUB
   end
 
-  subgraph Edge["Managed Microsoft Edge"]
-    direction LR
-    EXT["Signed MV3 extension<br/>user share and CDP controller"]
-    TAB["User-shared tab<br/>approved origin"]
-    EXT <-->|"bounded CDP operations"| TAB
+  subgraph Edge["Microsoft Edge"]
+    EXT["MV3 Extension<br/>用户 Grant + CDP Controller"]
+    TAB["用户主动共享的<br/>HTTP(S) 标签页"]
+    EXT <-->|"chrome.debugger / CDP<br/>受控操作与观察"| TAB
   end
 
-  EXT <-->|"Native Messaging<br/>allowed extension ID"| NATIVE
-  DEPLOY --> MCP
-  DEPLOY --> BROKER
-  DEPLOY --> NATIVE
-  DEPLOY --> EXT
-  DLP -->|"bounded MCP result"| MCP
+  CONFIG -->|"生成配对配置"| EXT
+  HUB <-->|"WebSocket /extension<br/>固定 Origin + hello Token"| EXT
+  USER["用户"] -->|"共享 / 撤销<br/>1-480 分钟"| EXT
+  PAGE["公网或内网页面"] -->|"正常浏览器网络"| TAB
 
-  classDef trust fill:#dcfce7,stroke:#15803d,color:#052e16
-  classDef control fill:#dbeafe,stroke:#1d4ed8,color:#172554
-  classDef user fill:#ffedd5,stroke:#c2410c,color:#431407
-  classDef admin fill:#f3e8ff,stroke:#7e22ce,color:#3b0764
-
-  class BROKER,NATIVE,EXT trust
-  class MCP,POLICY,DLP,AUDIT control
-  class TAB,AGENT user
-  class ADMIN,DEPLOY admin
+  classDef trusted fill:#e7f6ec,stroke:#267a45,color:#173b25
+  classDef transport fill:#e8f1fb,stroke:#2b67a0,color:#18344f
+  classDef user fill:#fff1db,stroke:#a96816,color:#51360f
+  class AGENT,MCP,CLIENT,HUB trusted
+  class CONFIG,EXT transport
+  class USER,TAB,PAGE user

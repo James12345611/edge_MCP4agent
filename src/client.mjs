@@ -1,116 +1,91 @@
-import net from 'node:net';
+import { CLIENT_RESPONSE_TIMEOUT_MS } from '../extension/limits.js';
 import { spawn } from 'node:child_process';
-import { mkdir, open } from 'node:fs/promises';
+import { open, mkdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { loadConfig } from './config.mjs';
+import { fileURLToPath } from 'node:url';
+import WebSocket from 'ws';
+import { loadConfig, VERSION } from './config.mjs';
 
-function probe(pipeName, timeout = 500) {
-  return new Promise(resolve => {
-    const socket = net.createConnection(pipeName);
-    const timer = setTimeout(() => {
-      socket.destroy();
-      resolve(false);
-    }, timeout);
-    socket.once('connect', () => {
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(true);
+export async function hubIsRunning(config) {
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${config.port}/health`, {
+      headers: { Authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(1000),
     });
-    socket.once('error', () => {
-      clearTimeout(timer);
-      resolve(false);
-    });
-  });
+  } catch (error) {
+    if (error.cause?.code === 'ECONNREFUSED' || error.name === 'TimeoutError') return false;
+    throw error;
+  }
+  if (!response.ok) throw new Error('Enterprise Browser MCP port is occupied by an unpaired service');
+  const health = await response.json();
+  if (health.service !== 'enterprise-browser-mcp' || health.version !== VERSION)
+    throw new Error('Hub version differs from this package; stop the hub and start again.');
+  return true;
 }
 
-export async function ensureBroker(configPath) {
+export async function ensureHub(configPath) {
   configPath = resolve(configPath);
   const config = await loadConfig(configPath);
-  if (await probe(config.pipeName)) return config;
-  await mkdir(dirname(configPath), { recursive: true });
-  const log = await open(join(dirname(configPath), 'broker.log'), 'a', 0o600);
-  const child = spawn(config.nodePath, [config.brokerScript, 'broker', '--config', configPath], {
-    detached: true,
-    windowsHide: true,
-    stdio: ['ignore', log.fd, log.fd],
+  if (await hubIsRunning(config)) return config;
+  await mkdir(dirname(configPath), { recursive: true, mode: 0o700 });
+  const log = await open(join(dirname(configPath), 'hub.log'), 'a', 0o600);
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../bin/enterprise-browser-mcp.mjs', import.meta.url)), 'hub', '--config', configPath], {
+    detached: true, windowsHide: true, stdio: ['ignore', log.fd, log.fd],
     env: { ...process.env, ENTERPRISE_BROWSER_MCP_HOME: dirname(configPath) },
   });
-  child.unref();
-  await log.close();
-  for (let attempt = 0; attempt < 40; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 100));
-    if (await probe(config.pipeName)) return config;
+  let spawnError;
+  child.on('error', error => { spawnError = error; });
+  child.unref(); await log.close();
+  for (let i = 0; i < 40; i++) {
+    if (spawnError) throw spawnError;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    if (await hubIsRunning(config)) return config;
   }
-  throw new Error(`Broker failed to start. See ${join(dirname(configPath), 'broker.log')}`);
+  throw new Error(`Hub did not start. See ${join(dirname(configPath), 'hub.log')}`);
 }
 
-export class BrokerClient {
-  constructor(config) {
-    this.config = config;
-    this.pending = new Map();
-    this.counter = 0;
-  }
-
+export class AttachClient {
+  constructor(config) { this.config = config; this.pending = new Map(); this.counter = 0; }
   async connect() {
-    if (this.socket && !this.socket.destroyed) return;
-    this.socket = net.createConnection(this.config.pipeName);
-    await new Promise((resolve, reject) => {
-      this.socket.once('connect', resolve);
-      this.socket.once('error', reject);
+    if (this.socket?.readyState === WebSocket.OPEN) return;
+    if (this.connecting) return this.connecting;
+    this.connecting = new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${this.config.port}/client`, {
+        headers: { Authorization: `Bearer ${this.config.token}` }, maxPayload: 24 * 1024 * 1024,
+      });
+      this.socket = ws;
+      ws.once('open', resolve); ws.once('error', reject);
+      ws.on('message', raw => {
+        let data;
+        try { data = JSON.parse(raw.toString()); } catch { ws.close(); return; }
+        const item = this.pending.get(data.id);
+        if (!item) return;
+        this.pending.delete(data.id); clearTimeout(item.timer);
+        if ('error' in data) item.reject(new Error(String(data.error))); else item.resolve(data.result);
+      });
+      ws.on('close', () => {
+        reject(new Error('Hub connection closed'));
+        for (const item of this.pending.values()) { clearTimeout(item.timer); item.reject(new Error('Hub disconnected; outcome may be unknown. Observe again.')); }
+        this.pending.clear(); this.connecting = null;
+      });
     });
-    this.socket.write(`${JSON.stringify({ type: 'hello', role: 'mcp', pid: process.pid, parent_pid: process.ppid })}\n`);
-    let buffer = '';
-    this.socket.setEncoding('utf8');
-    this.socket.on('data', chunk => {
-      buffer += chunk;
-      for (;;) {
-        const newline = buffer.indexOf('\n');
-        if (newline < 0) break;
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        if (!line) continue;
-        let message;
-        try {
-          message = JSON.parse(line);
-        } catch {
-          this.socket.destroy();
-          continue;
-        }
-        const item = this.pending.get(String(message.id));
-        if (!item) continue;
-        this.pending.delete(String(message.id));
-        clearTimeout(item.timer);
-        if ('error' in message) item.reject(new Error(String(message.error)));
-        else item.resolve(message.result);
-      }
-    });
-    this.socket.on('close', () => {
-      for (const item of this.pending.values()) {
-        clearTimeout(item.timer);
-        item.reject(new Error('Broker connection closed'));
-      }
-      this.pending.clear();
-    });
+    return this.connecting;
   }
-
   async call(method, args = {}) {
     await this.connect();
-    return await new Promise((resolve, reject) => {
-      const id = String(++this.counter);
+    return new Promise((resolve, reject) => {
+      const id = ++this.counter;
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error('Broker response timed out'));
-      }, method === 'read_url' ? 50000 : 20000);
+        this.pending.delete(id); this.socket.close();
+        reject(new Error('Hub response timed out; outcome may be unknown. Observe again.'));
+      }, CLIENT_RESPONSE_TIMEOUT_MS);
       this.pending.set(id, { resolve, reject, timer });
-      this.socket.write(`${JSON.stringify({ id, method, arguments: args })}\n`);
+      this.socket.send(JSON.stringify({ id, method, arguments: args }));
     });
   }
-
   async close() {
-    if (!this.socket || this.socket.destroyed) return;
-    await new Promise(resolve => {
-      this.socket.once('close', resolve);
-      this.socket.end();
-    });
+    const ws = this.socket;
+    if (!ws || ws.readyState === WebSocket.CLOSED) return;
+    await new Promise(resolve => { ws.once('close', resolve); ws.close(); });
   }
 }

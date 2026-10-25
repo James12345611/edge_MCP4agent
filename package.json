@@ -1,6 +1,6 @@
 {
   "name": "@enterprise/browser-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "license": "UNLICENSED",
@@ -13,12 +13,14 @@
   "scripts": {
     "setup": "node bin/enterprise-browser-mcp.mjs setup",
     "mcp": "node bin/enterprise-browser-mcp.mjs mcp",
-    "broker": "node bin/enterprise-browser-mcp.mjs broker",
+    "hub": "node bin/enterprise-browser-mcp.mjs hub",
     "test": "node --test tests/*.test.mjs",
-    "extract:ozon": "node scripts/extract-ozon.mjs"
+    "extract:ozon": "node scripts/extract-ozon.mjs",
+    "analyze:ozon-responses": "node scripts/analyze-ozon-response-fields.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
+    "ws": "8.22.0",
     "zod": "4.6.7"
   }
 }

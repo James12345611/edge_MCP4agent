@@ -10,6 +10,10 @@ body {
   padding: 16px;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 header {
   display: grid;
   gap: 4px;
@@ -31,6 +35,11 @@ header {
 #status {
   color: #176b4d;
   font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+#status.error {
+  color: #a93226;
 }
 
 #duration-setting {
@@ -74,6 +83,10 @@ button {
   color: #fff;
   font: inherit;
   cursor: pointer;
+}
+
+button + button {
+  margin-top: 8px;
 }
 
 #revoke {

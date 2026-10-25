@@ -4,6 +4,11 @@ import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { ROOT, DEFAULT_CONFIG } from '../src/config.mjs';
+import {
+  parseResponseFields,
+  responseFieldSummary,
+  responseFieldsMarkdown,
+} from '../src/ozon-response-fields.mjs';
 
 const outputArg = process.argv.find(arg => arg.startsWith('--output='));
 const maxPagesArg = process.argv.find(arg => arg.startsWith('--max-pages='));
@@ -86,6 +91,93 @@ function pageMarkdown(page) {
   ].join('\n');
 }
 
+async function evaluateCurrentPage(tabHandle) {
+  const expression = `(() => {
+    const clean = value => String(value || '')
+      .replace(/\\u00a0/g, ' ')
+      .replace(/[ \\t]+\\n/g, '\\n')
+      .replace(/\\n{3,}/g, '\\n\\n')
+      .trim();
+    const links = [];
+    const seen = new Set();
+    for (const node of document.querySelectorAll('a[href]')) {
+      let href;
+      try { href = new URL(node.getAttribute('href'), location.href).href; } catch { continue; }
+      if (!/^https?:/.test(href)) continue;
+      const normalized = href.split('#')[0];
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      links.push({ text: clean(node.innerText || node.textContent).slice(0, 500), href: normalized });
+      if (links.length >= 10000) break;
+    }
+    const page = {
+      title: document.title,
+      url: location.href,
+      lang: document.documentElement.lang || null,
+      headings: [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].slice(0, 5000).map(node => ({
+        level: Number(node.tagName.slice(1)),
+        text: clean(node.innerText || node.textContent).slice(0, 2000),
+      })).filter(item => item.text),
+      links,
+      code_blocks: [],
+      text: clean(document.body?.innerText || ''),
+      truncated: false,
+      extracted_at: new Date().toISOString(),
+    };
+    const json = JSON.stringify(page);
+    const chunks = [];
+    for (let offset = 0; offset < json.length; offset += 40000) chunks.push(json.slice(offset, offset + 40000));
+    return chunks;
+  })()`;
+  let result = await call('evaluate', {
+    tab_handle: tabHandle,
+    expression,
+    max_chars: 100000,
+    timeout_ms: 30000,
+  });
+  const chunks = [...(result.value || [])];
+  while (result.next_cursor) {
+    result = await call('evaluate', {
+      tab_handle: tabHandle,
+      cursor: result.next_cursor,
+      max_chars: 100000,
+    });
+    chunks.push(...(result.value || []));
+  }
+  return JSON.parse(chunks.join(''));
+}
+
+async function fetchPage(tabHandle, url) {
+  let result = await call('fetch', {
+    tab_handle: tabHandle,
+    url,
+    format: 'text',
+    wait_until: 'load',
+    max_chars: 100000,
+    timeout_ms: 30000,
+  });
+  let text = result.body || '';
+  while (result.next_cursor) {
+    result = await call('fetch', {
+      tab_handle: tabHandle,
+      cursor: result.next_cursor,
+      max_chars: 100000,
+    });
+    text += result.body || '';
+  }
+  return {
+    title: result.title || url,
+    url: result.url || url,
+    lang: null,
+    headings: [],
+    links: [],
+    code_blocks: [],
+    text,
+    truncated: !!result.capture_truncated,
+    extracted_at: new Date().toISOString(),
+  };
+}
+
 const methodPattern = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/;
 const pathPattern = /^\/[A-Za-z0-9_~!$&'()*+,;=:@%./{}-]+$/;
 
@@ -125,6 +217,7 @@ function endpointFile(section) {
 }
 
 function endpointMarkdown(section, page) {
+  const schemas = parseResponseFields(section.content);
   return [
     '---',
     `title: ${JSON.stringify(section.title)}`,
@@ -137,6 +230,10 @@ function endpointMarkdown(section, page) {
     `# ${section.title}`,
     '',
     `\`${section.method} ${section.path}\``,
+    '',
+    '## Response fields',
+    '',
+    responseFieldsMarkdown(schemas),
     '',
     '## Rendered documentation',
     '',
@@ -154,8 +251,7 @@ try {
   const shared = await call('list_shared_tabs', {});
   const tab = shared.tabs.find(item => /ozon/i.test(`${item.title} ${item.url}`));
   if (!tab) throw new Error('No user-shared Ozon tab is available. Share the open Ozon API documentation tab from the extension popup.');
-  const claim = await call('claim_tab', { tab_id: tab.tab_id, expected_origin: tab.origin });
-  handle = claim.tab_handle;
+  handle = tab.tab_handle;
   const start = new URL(tab.url);
   const queue = [normalizeUrl(tab.url)];
   const queued = new Set(queue);
@@ -171,8 +267,8 @@ try {
     process.stderr.write(`[${pages.length + 1}/${Math.min(maxPages, pages.length + queue.length + 1)}] ${url}\n`);
     try {
       const page = pages.length === 0 && normalizeUrl(tab.url) === url
-        ? await call('extract_page', { tab_handle: handle, max_chars: 4000000 })
-        : await call('read_url', { tab_handle: handle, url, max_chars: 4000000 });
+        ? await evaluateCurrentPage(handle)
+        : await fetchPage(handle, url);
       const normalizedPageUrl = normalizeUrl(page.url);
       if (new URL(normalizedPageUrl).origin !== start.origin) continue;
       if (!page.text && !page.headings.length && !page.code_blocks.length) {
@@ -195,12 +291,16 @@ try {
       for (const section of endpointSections(page)) {
         const key = `${section.method} ${section.path}`;
         const document = endpointFile(section);
+        const responses = parseResponseFields(section.content);
+        const responseSummary = responseFieldSummary(responses);
         const current = endpoints.get(key) || {
           method: section.method,
           path: section.path,
           title: section.title,
           document,
           pages: [],
+          ...responseSummary,
+          responses,
         };
         if (!current.pages.includes(file)) current.pages.push(file);
         endpoints.set(key, current);
@@ -243,6 +343,19 @@ try {
     endpoints: endpointRows,
     errors,
   }, null, 2)}\n`, 'utf8');
+  await writeFile(join(outputDir, 'RESPONSE-FIELDS.json'), `${JSON.stringify({
+    generated_at: new Date().toISOString(),
+    endpoints: endpointRows.map(item => ({
+      method: item.method,
+      path: item.path,
+      title: item.title,
+      document: item.document,
+      schema_count: item.schema_count,
+      field_count: item.field_count,
+      chinese_annotation_count: item.chinese_annotation_count,
+      schemas: item.responses,
+    })),
+  }, null, 2)}\n`, 'utf8');
   const truncatedPages = pages.filter(page => page.truncated).length;
   await writeFile(join(outputDir, 'README.md'), [
     '# Ozon Seller API documentation export',
@@ -262,7 +375,7 @@ try {
   console.log(JSON.stringify({ outputDir, pages: pages.length, endpoints: endpointRows.length, errors: errors.length, remaining: queue.length }, null, 2));
 } finally {
   if (handle) {
-    try { await call('release_tab', { tab_handle: handle }); } catch {}
+    try { await call('tab_control', { action: 'release', tab_handle: handle }); } catch {}
   }
   await client.close().catch(() => {});
 }

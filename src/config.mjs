@@ -2,8 +2,7 @@ import { readFile, mkdir, writeFile, rename, chmod } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.1.0';
-export const NATIVE_HOST_NAME = 'com.enterprise.browser_mcp';
+export const VERSION = '0.2.0';
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const configuredHome = process.env.ENTERPRISE_BROWSER_MCP_HOME;
 if (configuredHome && !isAbsolute(configuredHome)) {
@@ -22,10 +21,12 @@ export async function loadConfig(path = DEFAULT_CONFIG) {
     throw new Error(`Cannot read ${resolve(path)}. Run enterprise-browser-mcp setup first.`, { cause: error });
   }
   if (config.version !== VERSION ||
-      typeof config.pipeName !== 'string' ||
-      typeof config.allowedOrigin !== 'string' ||
-      typeof config.nodePath !== 'string' ||
-      typeof config.brokerScript !== 'string') {
+      typeof config.token !== 'string' ||
+      config.token.length < 32 ||
+      !Number.isInteger(config.port) ||
+      config.port < 1024 ||
+      config.port > 65535 ||
+      !/^[a-p]{32}$/.test(config.extension_id)) {
     throw new Error('Invalid or incompatible enterprise browser MCP config');
   }
   return config;

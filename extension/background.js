@@ -1,17 +1,21 @@
+import { CONNECTION } from './config.generated.js';
+import { createController } from './controller.js';
 import { normalizeGrantMinutes } from './grant-policy.js';
 
-const NATIVE_HOST = 'com.enterprise.browser_mcp';
 const grants = new Map();
-const claims = new Map();
-let port;
-let reconnectTimer;
+const bindings = new Map();
+let socket;
+let connecting = false;
+let keepAlive;
+let reconnect;
+let connectionStatus = 'disconnected';
 
-function originOf(url) {
+function httpUrl(url) {
   const parsed = new URL(url);
   if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
-    throw new Error('Only credential-free HTTP(S) pages can be shared');
+    throw new Error('Only credential-free HTTP(S) tabs can be shared');
   }
-  return parsed.origin;
+  return parsed;
 }
 
 async function persistGrants() {
@@ -30,26 +34,41 @@ async function updateBadge() {
   await chrome.action.setBadgeBackgroundColor({ color: '#13755b' });
 }
 
+const controller = createController(chrome, event => {
+  if (event.type === 'detached') bindings.delete(event.tab_id);
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+});
+
+async function releaseBinding(tabId) {
+  const binding = bindings.get(tabId);
+  if (!binding) return;
+  try {
+    await controller.execute(binding.owner, 'release_tab', {
+      tab_id: tabId,
+      tab_handle: binding.handle,
+    });
+  } catch {
+    // A closed or already detached tab is already released.
+  } finally {
+    bindings.delete(tabId);
+  }
+}
+
 async function revoke(tabId) {
   grants.delete(tabId);
-  for (const [handle, claim] of claims) {
-    if (claim.tab_id !== tabId) continue;
-    try { await chrome.debugger.detach({ tabId }); } catch {}
-    claims.delete(handle);
-  }
   await persistGrants();
   await updateBadge();
+  await releaseBinding(tabId);
 }
 
 async function cleanupGrants() {
-  for (const [tabId, grant] of grants) {
+  for (const [tabId, grant] of [...grants]) {
     if (grant.expires_at <= Date.now()) {
       await revoke(tabId);
       continue;
     }
     try {
-      const tab = await chrome.tabs.get(tabId);
-      if (originOf(tab.url) !== grant.origin) await revoke(tabId);
+      await chrome.tabs.get(tabId);
     } catch {
       await revoke(tabId);
     }
@@ -58,21 +77,36 @@ async function cleanupGrants() {
 
 async function shareCurrentTab(tabId, requestedMinutes) {
   const tab = await chrome.tabs.get(tabId);
-  const origin = originOf(tab.url);
-  const grantMinutes = normalizeGrantMinutes(requestedMinutes);
+  httpUrl(tab.url);
+  const minutes = normalizeGrantMinutes(requestedMinutes);
   const grant = {
     grant_id: crypto.randomUUID(),
     tab_id: tabId,
-    origin,
-    duration_minutes: grantMinutes,
+    duration_minutes: minutes,
     created_at: Date.now(),
-    expires_at: Date.now() + grantMinutes * 60 * 1000,
-    capabilities: ['read', 'read_same_origin'],
+    expires_at: Date.now() + minutes * 60 * 1000,
+    capabilities: [
+      'read',
+      'interact',
+      'navigate',
+      'evaluate',
+      'logs',
+      'files',
+      'fetch',
+    ],
   };
   grants.set(tabId, grant);
   await persistGrants();
   await updateBadge();
-  return { shared: true, grant, title: tab.title || '', url: tab.url };
+  return { shared: true, grant, title: tab.title || '', url: tab.url || '' };
+}
+
+function currentGrant(tabId) {
+  const grant = grants.get(tabId);
+  if (!grant || grant.expires_at <= Date.now()) {
+    throw new Error('Tab share expired or was revoked');
+  }
+  return grant;
 }
 
 async function listSharedTabs() {
@@ -81,249 +115,195 @@ async function listSharedTabs() {
   for (const grant of grants.values()) {
     try {
       const tab = await chrome.tabs.get(grant.tab_id);
+      const controllable = /^https?:\/\//.test(tab.url || '');
       tabs.push({
         tab_id: tab.id,
+        window_id: tab.windowId,
         title: tab.title || '',
         url: tab.url || '',
-        origin: grant.origin,
+        active: tab.active,
+        group_id: tab.groupId,
+        controllable,
+        grant_id: grant.grant_id,
         expires_at: new Date(grant.expires_at).toISOString(),
         capabilities: grant.capabilities,
       });
-    } catch {}
+    } catch {
+      await revoke(grant.tab_id);
+    }
   }
   return { tabs };
 }
 
-function claimFor(owner, handle) {
-  const claim = claims.get(handle);
-  if (!claim || claim.owner !== owner) throw new Error('Tab handle is stale or belongs to another MCP connection');
-  const grant = grants.get(claim.tab_id);
-  if (!grant || grant.expires_at <= Date.now()) throw new Error('Tab grant expired or was revoked');
-  return { claim, grant };
-}
-
-async function attach(tabId) {
-  try {
-    await chrome.debugger.attach({ tabId }, '1.3');
-  } catch (error) {
-    if (!String(error.message).includes('already attached')) throw error;
-  }
-  await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
-}
-
-function extractionExpression(maxChars) {
-  return `(() => {
-    const limit = ${maxChars};
-    const clean = value => String(value || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
-    const text = clean(document.body?.innerText || '').slice(0, limit);
-    const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].slice(0, 5000).map(node => ({
-      level: Number(node.tagName.slice(1)), text: clean(node.innerText || node.textContent).slice(0, 2000)
-    })).filter(item => item.text);
-    const links = [];
-    const seen = new Set();
-    for (const node of document.querySelectorAll('a[href]')) {
-      let href;
-      try { href = new URL(node.getAttribute('href'), location.href).href; } catch { continue; }
-      if (!/^https?:/.test(href)) continue;
-      const normalized = href.split('#')[0];
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-      links.push({ text: clean(node.innerText || node.textContent).slice(0, 500), href: normalized });
-      if (links.length >= 10000) break;
-    }
-    const code_blocks = [];
-    let codeChars = 0;
-    for (const node of document.querySelectorAll('pre, code')) {
-      const value = clean(node.innerText || node.textContent);
-      if (!value || codeChars + value.length > Math.min(limit, 2000000)) continue;
-      code_blocks.push(value);
-      codeChars += value.length;
-      if (code_blocks.length >= 5000) break;
-    }
-    return {
-      title: document.title,
-      url: location.href,
-      origin: location.origin,
-      lang: document.documentElement.lang || null,
-      headings,
-      links,
-      code_blocks,
-      text,
-      truncated: text.length >= limit,
-      extracted_at: new Date().toISOString()
-    };
-  })()`;
-}
-
-async function extractTab(tabId, maxChars) {
-  const response = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-    expression: extractionExpression(maxChars),
-    returnByValue: true,
-    awaitPromise: true,
-    userGesture: false,
-  });
-  if (response.exceptionDetails) throw new Error(response.exceptionDetails.text || 'Page extraction failed');
-  if (!response.result?.value) throw new Error('Page extraction returned no value');
-  return response.result.value;
-}
-
-function waitForLoad(tabId, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error('Temporary documentation tab did not load in time'));
-    }, timeoutMs);
-    const listener = (updatedId, changeInfo) => {
-      if (updatedId !== tabId || changeInfo.status !== 'complete') return;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.get(tabId).then(tab => {
-      if (tab.status === 'complete') {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    }).catch(reject);
-  });
-}
-
-async function readUrl(owner, args) {
-  const { grant } = claimFor(owner, args.tab_handle);
-  const parsed = new URL(args.url);
-  if (parsed.origin !== grant.origin || !['http:', 'https:'].includes(parsed.protocol)) {
-    throw new Error('read_url is restricted to the user-shared origin');
-  }
-  let tab;
-  try {
-    tab = await chrome.tabs.create({ url: parsed.href, active: false });
-    await waitForLoad(tab.id);
-    await attach(tab.id);
-    await new Promise(resolve => setTimeout(resolve, 750));
-    const current = await chrome.tabs.get(tab.id);
-    if (originOf(current.url) !== grant.origin) throw new Error('Documentation URL redirected outside the shared origin');
-    return await extractTab(tab.id, args.max_chars ?? 2000000);
-  } finally {
-    if (tab) {
-      try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
-      try { await chrome.tabs.remove(tab.id); } catch {}
-    }
-  }
-}
-
 async function execute(owner, command, args) {
-  if (command === 'list_shared_tabs') return await listSharedTabs();
-  if (command === 'claim_tab') {
-    await cleanupGrants();
-    const grant = grants.get(args.tab_id);
-    if (!grant) throw new Error('Tab is not shared by the user');
-    if (args.expected_origin && args.expected_origin !== grant.origin) throw new Error('Shared tab origin changed');
-    for (const claim of claims.values()) {
-      if (claim.tab_id === args.tab_id && claim.owner !== owner) throw new Error('Tab is controlled by another MCP connection');
-      if (claim.tab_id === args.tab_id && claim.owner === owner) return { tab_handle: claim.handle, tab_id: claim.tab_id, origin: grant.origin };
-    }
-    await attach(args.tab_id);
-    const handle = crypto.randomUUID();
-    claims.set(handle, { handle, owner, tab_id: args.tab_id });
-    return { tab_handle: handle, tab_id: args.tab_id, origin: grant.origin, expires_at: new Date(grant.expires_at).toISOString() };
-  }
+  if (command === 'list_tabs') return await listSharedTabs();
   if (command === 'release_owner') {
-    let released = 0;
-    for (const [handle, claim] of [...claims]) {
-      if (claim.owner !== owner) continue;
-      try { await chrome.debugger.detach({ tabId: claim.tab_id }); } catch {}
-      claims.delete(handle);
-      released++;
+    const result = await controller.execute(owner, command, args);
+    for (const [tabId, binding] of [...bindings]) {
+      if (binding.owner === owner) bindings.delete(tabId);
     }
-    return { released };
+    return result;
   }
-  if (command === 'read_url') return await readUrl(owner, args);
-  const { claim, grant } = claimFor(owner, args.tab_handle);
-  const tab = await chrome.tabs.get(claim.tab_id);
-  if (originOf(tab.url) !== grant.origin) {
-    await revoke(claim.tab_id);
-    throw new Error('Tab navigated outside the shared origin');
+  if (command === 'fetch') {
+    currentGrant(args.authorized_tab_id);
+    return await controller.execute(owner, command, args);
   }
-  if (command === 'extract_page') return await extractTab(claim.tab_id, args.max_chars ?? 2000000);
-  if (command === 'release_tab') {
-    try { await chrome.debugger.detach({ tabId: claim.tab_id }); } finally { claims.delete(args.tab_handle); }
-    return { released: true, tab_id: claim.tab_id };
+
+  const tabId = args.tab_id;
+  currentGrant(tabId);
+  if (command === 'claim_tab') {
+    const tab = await chrome.tabs.get(tabId);
+    httpUrl(tab.url);
+    const result = await controller.execute(owner, command, args);
+    bindings.set(tabId, { owner, handle: args.tab_handle });
+    return result;
   }
-  throw new Error(`Unknown browser command: ${command}`);
+
+  const binding = bindings.get(tabId);
+  if (!binding || binding.owner !== owner || binding.handle !== args.tab_handle) {
+    throw new Error('Shared tab is not attached to this MCP connection');
+  }
+  const result = await controller.execute(owner, command, args);
+  if (command === 'release_tab' || command === 'close_tab') bindings.delete(tabId);
+  if (command === 'close_tab') {
+    grants.delete(tabId);
+    await persistGrants();
+    await updateBadge();
+  }
+  return result;
 }
 
-function connectNative() {
-  clearTimeout(reconnectTimer);
-  if (port) return;
+async function getIdentity() {
+  const local = await chrome.storage.local.get(['instanceId', 'profileName']);
+  const session = await chrome.storage.session.get('runId');
+  const instanceId = local.instanceId || crypto.randomUUID();
+  const runId = session.runId || crypto.randomUUID();
+  if (!local.instanceId) await chrome.storage.local.set({ instanceId });
+  if (!session.runId) await chrome.storage.session.set({ runId });
+  const family = /Edg\//.test(navigator.userAgent) ? 'edge' : 'chrome';
+  return {
+    instance_id: instanceId,
+    run_id: runId,
+    family,
+    profile_name: local.profileName || (family === 'edge' ? 'Edge' : 'Chrome'),
+    user_agent: navigator.userAgent,
+    extension_id: chrome.runtime.id,
+    extension_version: chrome.runtime.getManifest().version,
+  };
+}
+
+async function connect() {
+  if (connecting || socket?.readyState === WebSocket.OPEN) return;
+  connecting = true;
   try {
-    port = chrome.runtime.connectNative(NATIVE_HOST);
-    port.postMessage({
-      type: 'browser_hello',
-      extension_id: chrome.runtime.id,
-      version: chrome.runtime.getManifest().version,
-    });
-    port.onMessage.addListener(async message => {
-      if (message.type === 'connected') return;
-      if (message.type !== 'command' || !message.id) return;
+    const identity = await getIdentity();
+    const ws = new WebSocket(CONNECTION.url);
+    socket = ws;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'hello', token: CONNECTION.token, browser: identity }));
+      keepAlive = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+      }, 20000);
+    };
+    ws.onmessage = async event => {
+      let request;
       try {
-        const result = await execute(message.owner, message.command, message.arguments || {});
-        port.postMessage({ type: 'response', id: message.id, result });
+        request = JSON.parse(event.data);
+        if (request.type === 'connected') {
+          connectionStatus = 'connected';
+          await updateBadge();
+          return;
+        }
+        if (!request.id) return;
+        const result = await execute(request.owner, request.command, request.arguments || {});
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ id: request.id, result }));
+        }
       } catch (error) {
-        port.postMessage({ type: 'response', id: message.id, error: error.message || String(error) });
+        if (request?.id && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ id: request.id, error: error.message || String(error) }));
+        }
       }
-    });
-    port.onDisconnect.addListener(async () => {
-      port = null;
-      for (const claim of claims.values()) {
-        try { await chrome.debugger.detach({ tabId: claim.tab_id }); } catch {}
-      }
-      claims.clear();
-      reconnectTimer = setTimeout(connectNative, 2000);
-    });
-  } catch {
-    reconnectTimer = setTimeout(connectNative, 2000);
+    };
+    ws.onclose = async () => {
+      clearInterval(keepAlive);
+      connectionStatus = 'disconnected';
+      connecting = false;
+      await controller.releaseAll();
+      bindings.clear();
+      await updateBadge();
+      clearTimeout(reconnect);
+      reconnect = setTimeout(connect, 2000);
+    };
+    ws.onerror = () => ws.close();
+  } catch (error) {
+    connecting = false;
+    connectionStatus = error.message;
+    clearTimeout(reconnect);
+    reconnect = setTimeout(connect, 2000);
   }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return;
-  (async () => {
-    if (!port) connectNative();
-    if (message.type === 'popup_status') {
-      await cleanupGrants();
-      const tab = await chrome.tabs.get(message.tab_id);
-      return { shared: grants.has(tab.id), grant: grants.get(tab.id), title: tab.title, url: tab.url, native_connected: !!port };
-    }
-    if (message.type === 'share_tab') return await shareCurrentTab(message.tab_id, message.duration_minutes);
-    if (message.type === 'revoke_tab') {
-      await revoke(message.tab_id);
-      return { shared: false };
-    }
-    throw new Error('Unknown extension message');
-  })().then(respond, error => respond({ error: error.message || String(error) }));
-  return true;
-});
-
-chrome.tabs.onRemoved.addListener(tabId => revoke(tabId));
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.url && grants.has(tabId)) {
-    try {
-      if (originOf(changeInfo.url) !== grants.get(tabId).origin) revoke(tabId);
-    } catch {
-      revoke(tabId);
-    }
+  if (message.type === 'popup_status') {
+    Promise.all([cleanupGrants(), chrome.tabs.get(message.tab_id)])
+      .then(([, tab]) => respond({
+        shared: grants.has(tab.id),
+        grant: grants.get(tab.id),
+        title: tab.title,
+        url: tab.url,
+        hub_connected: connectionStatus === 'connected',
+        connection_status: connectionStatus,
+        controlled: bindings.has(tab.id),
+      }))
+      .catch(error => respond({ error: error.message }));
+    return true;
+  }
+  if (message.type === 'share_tab') {
+    shareCurrentTab(message.tab_id, message.duration_minutes)
+      .then(respond)
+      .catch(error => respond({ error: error.message }));
+    return true;
+  }
+  if (message.type === 'revoke_tab') {
+    revoke(message.tab_id)
+      .then(() => respond({ shared: false }))
+      .catch(error => respond({ error: error.message }));
+    return true;
+  }
+  if (message.type === 'reconnect') {
+    if (socket?.readyState === WebSocket.OPEN) socket.close();
+    else connect();
+    respond({ ok: true });
   }
 });
 
-connectNative();
-void (async () => {
+chrome.tabs.onRemoved.addListener(tabId => {
+  if (grants.has(tabId)) void revoke(tabId);
+});
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'connect') connect();
+  if (alarm.name === 'grant-cleanup') void cleanupGrants();
+});
+chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onInstalled.addListener(async () => {
+  await chrome.alarms.create('connect', { periodInMinutes: 0.5 });
+  await chrome.alarms.create('grant-cleanup', { periodInMinutes: 1 });
+  connect();
+});
+
+async function initialize() {
   try {
     await restoreGrants();
     await cleanupGrants();
     await updateBadge();
+    await chrome.alarms.create('connect', { periodInMinutes: 0.5 });
+    await chrome.alarms.create('grant-cleanup', { periodInMinutes: 1 });
+    connect();
   } catch (error) {
-    console.error('Enterprise Browser MCP initialization failed', error);
+    connectionStatus = `初始化失败：${error.message || String(error)}`;
   }
-})();
+}
+
+void initialize();

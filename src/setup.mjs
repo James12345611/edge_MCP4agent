@@ -1,33 +1,26 @@
-import { generateKeyPairSync, createHash, randomBytes } from 'node:crypto';
+import {
+  createHash,
+  createPublicKey,
+  generateKeyPairSync,
+  randomBytes,
+} from 'node:crypto';
 import { cp, mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { DEFAULT_CONFIG, NATIVE_HOST_NAME, ROOT, VERSION, writeJson } from './config.mjs';
+import { DEFAULT_CONFIG, ROOT, VERSION, writeJson } from './config.mjs';
+
+export const mcpSettings = (configPath = DEFAULT_CONFIG) => ({
+  command: process.execPath,
+  args: [join(ROOT, 'bin', 'enterprise-browser-mcp.mjs'), 'mcp', '--config', resolve(configPath)],
+  env: { ENTERPRISE_BROWSER_MCP_HOME: dirname(resolve(configPath)) },
+});
 
 function extensionId(publicKeyBase64) {
   const hex = createHash('sha256')
     .update(Buffer.from(publicKeyBase64, 'base64'))
     .digest('hex')
     .slice(0, 32);
-  return [...hex].map(char => String.fromCharCode(97 + parseInt(char, 16))).join('');
-}
-
-function compileNativeHost(output) {
-  const compiler = [
-    'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe',
-    'C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe',
-  ].find(existsSync);
-  if (!compiler) throw new Error('Windows C# compiler is unavailable');
-  const source = join(ROOT, 'native-host', 'Program.cs');
-  const result = spawnSync(compiler, [
-    '/nologo',
-    '/target:exe',
-    `/out:${output}`,
-    '/reference:System.Web.Extensions.dll',
-    source,
-  ], { encoding: 'utf8', windowsHide: true });
-  if (result.status !== 0) throw new Error(`Native Host compilation failed:\n${result.stdout}\n${result.stderr}`);
+  return [...hex].map(char => String.fromCharCode(97 + Number.parseInt(char, 16))).join('');
 }
 
 async function privateDirectory(path) {
@@ -52,13 +45,15 @@ async function privateDirectory(path) {
   if (acl.status !== 0) throw new Error(`Cannot secure the MCP data directory: ${acl.stderr || acl.stdout}`);
 }
 
-export async function setup({ configPath = DEFAULT_CONFIG, extensionDir } = {}) {
+export async function setup({ configPath = DEFAULT_CONFIG, extensionDir, port = 47832 } = {}) {
   configPath = resolve(configPath);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error('port must be 1024..65535');
+  }
+
   const dataDir = dirname(configPath);
-  const distDir = join(dataDir, 'bin');
   extensionDir = resolve(extensionDir || join(ROOT, 'extension-dev'));
   await privateDirectory(dataDir);
-  await mkdir(distDir, { recursive: true });
 
   const privateKeyPath = join(dataDir, 'dev-extension-private.pem');
   let privateKey;
@@ -71,64 +66,52 @@ export async function setup({ configPath = DEFAULT_CONFIG, extensionDir } = {}) 
     await writeFile(privateKeyPath, privateKey, { mode: 0o600 });
     if (process.platform !== 'win32') await chmod(privateKeyPath, 0o600);
   }
-  const { createPublicKey } = await import('node:crypto');
   const publicKeyBase64 = createPublicKey(privateKey)
     .export({ type: 'spki', format: 'der' })
     .toString('base64');
   const id = extensionId(publicKeyBase64);
-  const allowedOrigin = `chrome-extension://${id}/`;
 
-  await cp(join(ROOT, 'extension'), extensionDir, { recursive: true, force: true });
+  await cp(join(ROOT, 'extension'), extensionDir, {
+    recursive: true,
+    force: true,
+    filter: source => !source.endsWith('config.generated.js') && !source.endsWith('manifest.json'),
+  });
   await privateDirectory(extensionDir);
-  const manifestTemplate = JSON.parse(await readFile(join(extensionDir, 'manifest.template.json'), 'utf8'));
-  manifestTemplate.key = publicKeyBase64;
-  await writeJson(join(extensionDir, 'manifest.json'), manifestTemplate);
+  const manifest = JSON.parse(await readFile(join(extensionDir, 'manifest.template.json'), 'utf8'));
+  manifest.key = publicKeyBase64;
+  manifest.content_security_policy = {
+    extension_pages: `script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:${port}`,
+  };
+  await writeJson(join(extensionDir, 'manifest.json'), manifest);
 
-  const nativeHostExe = join(distDir, 'EnterpriseBrowserMcp.NativeHost.exe');
-  compileNativeHost(nativeHostExe);
-  let existingConfig;
+  let existing;
   try {
-    existingConfig = JSON.parse(await readFile(configPath, 'utf8'));
+    existing = JSON.parse(await readFile(configPath, 'utf8'));
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const pipeName = existingConfig?.version === VERSION && typeof existingConfig.pipeName === 'string'
-    ? existingConfig.pipeName
-    : `\\\\.\\pipe\\EnterpriseBrowserMcp-${randomBytes(16).toString('hex')}`;
-  const config = {
-    version: VERSION,
-    pipeName,
-    allowedOrigin,
-    extensionId: id,
-    extensionDir,
-    nodePath: process.execPath,
-    brokerScript: join(ROOT, 'bin', 'enterprise-browser-mcp.mjs'),
-    configPath,
-  };
+  const config = existing?.version === VERSION &&
+    existing.extension_id === id &&
+    existing.port === port &&
+    typeof existing.token === 'string'
+    ? existing
+    : {
+        version: VERSION,
+        port,
+        token: randomBytes(48).toString('base64url'),
+        extension_id: id,
+      };
+  config.extension_dir = extensionDir;
+  config.config_path = configPath;
   await writeJson(configPath, config);
+  await writeFile(
+    join(extensionDir, 'config.generated.js'),
+    `// Machine-local pairing secret. Never publish.\nexport const CONNECTION = ${JSON.stringify({
+      url: `ws://127.0.0.1:${port}/extension`,
+      token: config.token,
+    })};\n`,
+    { mode: 0o600 },
+  );
 
-  const nativeManifestPath = join(dataDir, `${NATIVE_HOST_NAME}.json`);
-  await writeJson(nativeManifestPath, {
-    name: NATIVE_HOST_NAME,
-    description: 'Enterprise Browser MCP Native Messaging Host',
-    path: nativeHostExe,
-    type: 'stdio',
-    allowed_origins: [allowedOrigin],
-  });
-
-  const registryKey = `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`;
-  const registry = spawnSync('reg.exe', [
-    'ADD', registryKey, '/ve', '/t', 'REG_SZ', '/d', nativeManifestPath, '/f',
-  ], { encoding: 'utf8', windowsHide: true });
-  if (registry.status !== 0) throw new Error(`Native Host registration failed: ${registry.stderr || registry.stdout}`);
-
-  return {
-    version: VERSION,
-    configPath,
-    extensionDir,
-    extensionId: id,
-    nativeHost: nativeHostExe,
-    nativeManifest: nativeManifestPath,
-    next: 'Load extensionDir as an unpacked Edge extension, then click its toolbar icon and share the target tab.',
-  };
+  return { config, configPath, extensionDir };
 }

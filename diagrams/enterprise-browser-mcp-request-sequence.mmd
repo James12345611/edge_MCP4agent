@@ -1,38 +1,44 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryTextColor": "#17202a", "lineColor": "#374151", "actorTextColor": "#17202a", "signalTextColor": "#17202a", "noteTextColor": "#17202a", "labelTextColor": "#17202a"}}}%%
 sequenceDiagram
-  actor U as User
-  participant E as Managed Extension
-  participant N as Native Host
-  participant B as Local Broker
-  participant M as MCP Server
-  participant A as Approved Agent
-  participant P as Shared Page
+  actor U as 用户
+  participant E as Edge 扩展
+  participant H as Loopback Hub
+  participant M as MCP Adapter
+  participant A as 本地 Agent
+  participant P as 共享页面
 
-  U->>E: Share current tab for 15 minutes
-  E->>N: tab_shared(tab, origin, capabilities, ttl)
-  N->>B: Forward grant over secured Named Pipe
-  B->>B: Validate browser identity and signed policy
-  B-->>E: grant_id and SHARED state
+  E->>H: WebSocket hello(固定 Origin, Token, 浏览器身份)
+  H-->>E: connected(browser_id)
+  U->>E: 共享当前标签页并设置 TTL
+  E->>E: 保存 tab-bound Grant
 
-  A->>M: MCP tool call(tab_handle, arguments)
-  M->>B: execute(operation_id, tool, arguments)
-  B->>B: Validate caller, owner, grant, origin and policy
+  A->>M: browser_list_shared_tabs
+  M->>H: list_shared_tabs
+  H->>E: list_tabs
+  E-->>H: 仅返回有效 Grant
+  H-->>M: connection-local tab_handle
+  M-->>A: 已共享标签页
 
-  alt Request denied
-    B->>B: Write redacted denial audit
-    B-->>M: Stable policy error
-    M-->>A: MCP error
-  else Request authorized
-    B->>N: execute_browser_command
-    N->>E: Native Messaging command
-    E->>E: Revalidate tab, document, frame and ref
-    E->>P: Dispatch once through bounded CDP operation
-    P-->>E: Browser result or event receipt
-    E-->>N: Bounded result
-    N-->>B: Operation result
-    B->>B: DLP, output budget and redacted audit
-    B-->>M: Sanitized result
+  A->>M: browser operation(tab_handle)
+  M->>H: operation(tab_handle, arguments)
+  H->>H: 校验句柄并取得独占租约
+  H->>E: 内部 claim + operation
+  E->>E: 校验 Grant、文档、frame、ref 和 actionability
+  E->>P: 通过 CDP 派发一次
+  P-->>E: 页面结果或事件回执
+
+  alt 结果可验证
+    E-->>H: verified result
+    H-->>M: bounded result
     M-->>A: MCP content
+  else 结果未知
+    E-->>H: OUTCOME_UNKNOWN + 后续观察
+    H-->>M: error，不自动重放
+    M-->>A: 先重新观察再决策
   end
 
-  Note over B,E: Navigation, revocation, disconnect or TTL expiry invalidates the grant
-  Note over B,A: A dispatched timeout returns OUTCOME_UNKNOWN and is never replayed automatically
+  A->>M: browser_tab_control(release)
+  M->>H: release_tab
+  H->>E: release_tab
+  E-->>H: detached
+  Note over U,E: Grant 保留到用户撤销、TTL 到期、标签关闭或浏览器重启

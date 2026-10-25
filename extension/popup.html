@@ -12,7 +12,7 @@
     <span id="connection"></span>
   </header>
   <p id="page"></p>
-  <p id="status"></p>
+  <p id="status">正在连接本机交互服务...</p>
   <label id="duration-setting">
     <span>授权时长</span>
     <span class="duration-control">
@@ -20,8 +20,8 @@
       <span>分钟</span>
     </span>
   </label>
-  <button id="share" type="button">共享当前标签</button>
-  <button id="revoke" type="button">立即撤销</button>
+  <button id="share" type="button" hidden>共享并允许 Agent 操作</button>
+  <button id="revoke" type="button" hidden>立即撤销</button>
   <script type="module" src="popup.js"></script>
 </body>
 </html>
